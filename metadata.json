@@ -1,0 +1,6 @@
+{
+  "name": "Bolt - P2P File Transfer",
+  "description": "Direct browser-to-browser encrypted P2P file sharing with zero limits, speed tracking, SHA-256 integrity verification, and clipboard sharing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

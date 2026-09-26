@@ -1,0 +1,15 @@
+{
+  "short_name": "Bolt",
+  "name": "Bolt - P2P File Transfer",
+  "icons": [
+    {
+      "src": "/bolt-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192 512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#090d16",
+  "theme_color": "#f59e0b",
+  "display": "standalone"
+}
