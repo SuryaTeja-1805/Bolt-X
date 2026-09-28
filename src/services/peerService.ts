@@ -70,6 +70,19 @@ export class RobustBoltPeerService {
   private ws: WebSocket | null = null;
   private pc: RTCPeerConnection | null = null;
   private dataChannel: RTCDataChannel | null = null;
+  // Incoming messages must be processed strictly in order (a file_start handler
+  // that awaits must not let chunks/file_end overtake it).
+  private rxQueue: Promise<void> = Promise.resolve();
+  // Relay-mode flow control: receiver acks every ACK_EVERY chunks, sender keeps
+  // at most RELAY_WINDOW chunks in flight so the server never gets flooded.
+  private relayAcked = 0;
+  private relayAckFileId = '';
+  private relayLastAckTime = 0;
+  private enqueueRx(task: () => Promise<void>): void {
+    this.rxQueue = this.rxQueue.then(task).catch((e) => {
+      console.warn('[Receive queue error]', e);
+    });
+  }
   private transportMode: 'p2p' | 'relay' | 'loopback' = 'p2p';
   private events: PeerServiceEvents;
 
@@ -146,10 +159,14 @@ export class RobustBoltPeerService {
     this.events.onDiagnosticsUpdate(this.diagnostics);
   }
 
-  private getSignalingUrl(): string {
-    if (typeof window === 'undefined') return 'ws://localhost:3000/ws/signaling';
+  private getSignalingUrl(roomCode: string, role: 'sender' | 'receiver'): string {
+    const params = `room=${encodeURIComponent(roomCode)}&role=${role}`;
+    if (typeof window === 'undefined') return `ws://localhost:3000/ws/signaling?${params}`;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${window.location.host}/ws/signaling`;
+    // The room/role query params let the Node server (which ignores them) and the
+    // Cloudflare Workers Durable Object variant (which needs them to route to the
+    // right room instance) both work against the exact same frontend build.
+    return `${proto}//${window.location.host}/ws/signaling?${params}`;
   }
 
   public initSender(roomCode: string, passcode: string = ''): void {
@@ -185,7 +202,7 @@ export class RobustBoltPeerService {
 
   private connectSignaling(roomCode: string, role: 'sender' | 'receiver', passcode: string): void {
     try {
-      const url = this.getSignalingUrl();
+      const url = this.getSignalingUrl(roomCode, role);
       const ws = new WebSocket(url);
       ws.binaryType = 'arraybuffer';
       this.ws = ws;
@@ -202,19 +219,21 @@ export class RobustBoltPeerService {
         );
       };
 
-      ws.onmessage = async (evt: MessageEvent) => {
-        if (evt.data instanceof ArrayBuffer) {
-          // Binary packet relayed via high-speed server tunnel
-          await this.handleBinaryChunk(evt.data);
-          return;
-        }
+      ws.onmessage = (evt: MessageEvent) => {
+        this.enqueueRx(async () => {
+          if (evt.data instanceof ArrayBuffer) {
+            // Binary packet relayed via high-speed server tunnel
+            await this.handleBinaryChunk(evt.data);
+            return;
+          }
 
-        try {
-          const msg = JSON.parse(evt.data);
-          await this.handleSignalingMessage(msg);
-        } catch (e) {
-          console.warn('[Signaling Message Parse Error]', e);
-        }
+          try {
+            const msg = JSON.parse(evt.data);
+            await this.handleSignalingMessage(msg);
+          } catch (e) {
+            console.warn('[Signaling Message Parse Error]', e);
+          }
+        });
       };
 
       ws.onclose = () => {
@@ -368,6 +387,7 @@ export class RobustBoltPeerService {
   }
 
   private setupDataChannel(dc: RTCDataChannel): void {
+    dc.bufferedAmountLowThreshold = 256 * 1024;
     dc.binaryType = 'arraybuffer';
 
     dc.onopen = () => {
@@ -377,17 +397,19 @@ export class RobustBoltPeerService {
       this.handleChannelReady();
     };
 
-    dc.onmessage = async (evt: MessageEvent) => {
-      if (evt.data instanceof ArrayBuffer) {
-        await this.handleBinaryChunk(evt.data);
-      } else {
-        try {
-          const msg = JSON.parse(evt.data);
-          await this.handleControlMessage(msg);
-        } catch (e) {
-          console.warn('[DataChannel Message Parse Error]', e);
+    dc.onmessage = (evt: MessageEvent) => {
+      this.enqueueRx(async () => {
+        if (evt.data instanceof ArrayBuffer) {
+          await this.handleBinaryChunk(evt.data);
+        } else {
+          try {
+            const msg = JSON.parse(evt.data);
+            await this.handleControlMessage(msg);
+          } catch (e) {
+            console.warn('[DataChannel Message Parse Error]', e);
+          }
         }
-      }
+      });
     };
 
     dc.onclose = () => {
@@ -512,6 +534,13 @@ export class RobustBoltPeerService {
         await this.handleFileEnd(msg);
         break;
 
+      case 'chunk_ack':
+        if (msg.fileId === this.relayAckFileId) {
+          this.relayAcked = Math.max(this.relayAcked, msg.received || 0);
+          this.relayLastAckTime = Date.now();
+        }
+        break;
+
       case 'file_received_ack':
         this.events.onFilesUpdate((prev) =>
           prev.map((f) =>
@@ -553,7 +582,8 @@ export class RobustBoltPeerService {
     let writable: FileSystemWritableFileStream | undefined;
     let fileHandle: FileSystemFileHandle | undefined;
 
-    if (this.useDiskStream && typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
+    const hasGesture = typeof navigator !== 'undefined' && (navigator as any).userActivation?.isActive;
+    if (this.useDiskStream && hasGesture && typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
       try {
         fileHandle = await (window as any).showSaveFilePicker({
           suggestedName: msg.name,
@@ -593,6 +623,10 @@ export class RobustBoltPeerService {
     const chunkData = new Uint8Array(buffer, 16);
     rec.sha.update(chunkData);
     rec.receivedChunks++;
+
+    if (rec.receivedChunks % 32 === 0) {
+      this.sendControlMessage({ type: 'chunk_ack', fileId: rec.meta.id, received: rec.receivedChunks });
+    }
 
     if (rec.writableStream) {
       await rec.writableStream.write(chunkData);
@@ -649,7 +683,7 @@ export class RobustBoltPeerService {
     const verified = computedHash.toLowerCase() === (msg.sha256 || '').toLowerCase();
 
     let downloadUrl: string | undefined;
-    if (!rec.writableStream && rec.chunks.length > 0) {
+    if (!rec.writableStream) {
       const blob = new Blob(rec.chunks as any, { type: rec.meta.type || 'application/octet-stream' });
       downloadUrl = URL.createObjectURL(blob);
 
@@ -824,26 +858,39 @@ export class RobustBoltPeerService {
       const total = item.totalChunks;
       let lastTime = Date.now();
       let lastBytes = 0;
+      this.relayAckFileId = item.id;
+      this.relayAcked = 0;
+      this.relayLastAckTime = Date.now();
 
+      try {
       for (let chunkIdx = 0; chunkIdx < total; chunkIdx++) {
-        // Backpressure management for WebRTC DataChannel
-        if (isP2p && this.dataChannel && this.dataChannel.bufferedAmount > 2 * 1024 * 1024) {
-          await new Promise<void>((resolve) => {
-            const onLow = () => {
-              this.dataChannel?.removeEventListener('bufferedamountlow', onLow);
-              resolve();
-            };
-            this.dataChannel?.addEventListener('bufferedamountlow', onLow);
-            setTimeout(() => {
-              this.dataChannel?.removeEventListener('bufferedamountlow', onLow);
-              resolve();
-            }, 60);
-          });
-        }
-
-        // Backpressure management for WebSocket Relay
-        if (!isP2p && this.ws && this.ws.bufferedAmount > 2 * 1024 * 1024) {
-          await new Promise((r) => setTimeout(r, 40));
+        // Backpressure: never let the send buffer grow past ~1 MB
+        if (isP2p) {
+          const dc = this.dataChannel;
+          while (dc && dc.readyState === 'open' && dc.bufferedAmount > 1024 * 1024) {
+            await new Promise<void>((resolve) => {
+              const done = () => {
+                dc.removeEventListener('bufferedamountlow', done);
+                clearTimeout(t);
+                resolve();
+              };
+              const t = setTimeout(done, 100);
+              dc.addEventListener('bufferedamountlow', done);
+            });
+          }
+          if (!dc || dc.readyState !== 'open') throw new Error('Connection to peer was lost');
+        } else {
+          // Relay: bounded window of un-acked chunks (8 MB) + socket buffer limit.
+          // If no ack arrives for 5s (e.g. older receiver build) just keep going.
+          while (
+            this.ws &&
+            this.ws.readyState === WebSocket.OPEN &&
+            (this.ws.bufferedAmount > 1024 * 1024 ||
+              (chunkIdx - this.relayAcked > 128 && Date.now() - this.relayLastAckTime < 5000))
+          ) {
+            await new Promise((r) => setTimeout(r, 15));
+          }
+          if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('Connection to server was lost');
         }
 
         const start = chunkIdx * CHUNK_SIZE;
@@ -898,6 +945,15 @@ export class RobustBoltPeerService {
             )
           );
         }
+      }
+
+      } catch (err: any) {
+        console.warn('[Send aborted]', err);
+        this.events.onFilesUpdate((prev) =>
+          prev.map((f) => (f.id === item.id ? { ...f, status: 'error', speedBps: 0, etaSeconds: 0 } : f))
+        );
+        this.events.onStatusChange('error', err?.message || 'Transfer interrupted');
+        return;
       }
 
       const hash = hasher.digest();
